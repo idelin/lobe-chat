@@ -1,4 +1,5 @@
 import type { LobeChatDatabase } from '@lobechat/database';
+import { sql } from 'drizzle-orm';
 
 import {
   ElasticsearchFtsSearchBackend,
@@ -52,6 +53,8 @@ interface FtsSearchBackendFactoryDependencies {
   ) => ElasticsearchFtsSearchClient;
   createPgLikeBackend?: (context: FtsSearchBackendFactoryContext) => FtsSearchBackend;
   createPgSearchBackend?: (context: FtsSearchBackendFactoryContext) => FtsSearchBackend;
+  /** When omitted, pg_search deployments probe pg_extension and fall back to pg_like. */
+  isPgSearchAvailable?: (db: LobeChatDatabase) => Promise<boolean>;
   loadElasticsearchConfig?: () => ElasticsearchFtsSearchConfig | undefined;
   loadFtsSearchProvider?: () => FtsSearchProvider;
 }
@@ -137,10 +140,44 @@ export const resolveFtsSearchProvider = (
   dependencies: FtsSearchBackendFactoryDependencies = {},
 ): FtsSearchProvider => dependencies.loadFtsSearchProvider?.() ?? ftsSearchEnv.FTS_SEARCH_PROVIDER;
 
+const readPgSearchFlag = (value: unknown) => value === true || value === 't' || value === 'true';
+
+let cachedPgSearchAvailable: Promise<boolean> | undefined;
+
+/**
+ * ParadeDB is absent on Neon. One catalog lookup per process decides whether
+ * the configured pg_search provider can run.
+ */
+export const isPgSearchExtensionAvailable = (db: LobeChatDatabase): Promise<boolean> => {
+  cachedPgSearchAvailable ??= (async () => {
+    try {
+      const result = await db.execute(sql`
+        SELECT EXISTS (
+          SELECT 1 FROM pg_extension WHERE extname = 'pg_search'
+        ) AS available
+      `);
+      const rows = Array.isArray(result) ? result : result.rows;
+      const available = readPgSearchFlag(rows?.[0]?.available);
+
+      if (!available) {
+        console.warn('[fts] pg_search extension is not installed; full-text search uses pg_like');
+      }
+
+      return available;
+    } catch {
+      console.warn('[fts] pg_search extension check failed; full-text search uses pg_like');
+      return false;
+    }
+  })();
+
+  return cachedPgSearchAvailable;
+};
+
 /**
  * Resolve the deployment-configured provider before constructing the stable repository facade.
  * Missing Elasticsearch configuration and provider failures remain visible; this layer never
- * falls back to pg_search.
+ * falls back to pg_search. A pg_search deployment whose database has no pg_search extension
+ * uses pg_like so memory, knowledge, and chat search do not send BM25 operators.
  */
 export const createFtsSearchRepo = async (
   input: CreateFtsSearchRepoInput,
@@ -151,7 +188,14 @@ export const createFtsSearchRepo = async (
     userId: input.userId,
     workspaceId: input.workspaceId,
   };
-  const provider = resolveFtsSearchProvider(dependencies);
+  let provider = resolveFtsSearchProvider(dependencies);
+
+  if (provider === FTS_SEARCH_PROVIDERS.pgSearch) {
+    const available = await (
+      dependencies.isPgSearchAvailable ?? isPgSearchExtensionAvailable
+    )(input.db);
+    if (!available) provider = FTS_SEARCH_PROVIDERS.pgLike;
+  }
   const context = {
     db: input.db,
     provider,

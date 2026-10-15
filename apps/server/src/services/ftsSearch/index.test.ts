@@ -83,11 +83,34 @@ describe('full-text search provider selection', () => {
       { db, userId: 'allowed-user', usage: 'unified_search' },
       {
         createPgSearchBackend: () => ({ key: 'pg_search', search: vi.fn() }),
+        isPgSearchAvailable: async () => true,
         loadFtsSearchProvider: () => FTS_SEARCH_PROVIDERS.pgSearch,
       },
     );
 
     expect(repo.ftsSearchCandidateEnabled).toBe(false);
+  });
+
+  it('uses pg_like when the pg_search extension is missing', async () => {
+    const createPgLikeBackend = vi.fn((): FtsSearchBackend => ({ key: 'pg_like', search: vi.fn() }));
+    const createPgSearchBackend = vi.fn(
+      (): FtsSearchBackend => ({ key: 'pg_search', search: vi.fn() }),
+    );
+    const repo = await createFtsSearchRepo(
+      { db, userId: 'allowed-user', usage: 'unified_search' },
+      {
+        createPgLikeBackend,
+        createPgSearchBackend,
+        isPgSearchAvailable: async () => false,
+        loadFtsSearchProvider: () => FTS_SEARCH_PROVIDERS.pgSearch,
+      },
+    );
+
+    expect(createPgLikeBackend).toHaveBeenCalledWith(
+      expect.objectContaining({ provider: FTS_SEARCH_PROVIDERS.pgLike }),
+    );
+    expect(createPgSearchBackend).not.toHaveBeenCalled();
+    expect(repo.ftsSearchCandidateEnabled).toBe(true);
   });
 
   it('routes the stable repository facade through the selected backend', async () => {
